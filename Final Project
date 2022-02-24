@@ -1,0 +1,441 @@
+library(sf)
+library(readxl)
+library(janitor)
+library(tmap)
+library(dplyr)
+library(sp)
+library(spdep)
+library(DCluster)
+library(cartogram)
+library(ggplot2)
+library(readr)
+library(hexbin)
+library(ggspatial)
+library(geogrid)
+library(rjson)
+library(purrr)
+library(leaflet)
+library(RColorBrewer)
+library(gganimate)
+library(spatialreg)
+library(lubridate)
+
+# read data
+crimes <- read_xlsx("gmp_crimes_2021.xlsx") %>% clean_names()
+
+# glimpse the dataframe
+library(tibble)
+glimpse(crimes)
+
+# create a sf object from our database
+crimes_sf <- st_as_sf(crimes, coords = c("longitude", "latitude"), crs = 4326, na.fail = FALSE)
+
+# map it
+ggplot(subset(crimes, !is.na(last_outcome_category)), aes(x=crime_type, fill = crime_type)) + 
+  geom_bar()
+
+# map our points
+ggplot() +
+  geom_sf(data = crimes_sf)
+
+# put a basemap
+ggplot() + 
+  annotation_map_tile() +
+  geom_sf(data=crimes_sf)
+
+# filter only to Moss Side
+crimes_ms <- filter(crimes, ward == "Moss Side")
+crimes_ms_spatial = st_as_sf(crimes_ms, coords = c("longitude", "latitude"), crs = 4326, agr = "constant")
+
+# map it with a basemap
+ggplot() + 
+  annotation_map_tile() +
+  geom_sf(data=crimes_ms_spatial)
+
+
+shp_name <- "BoundaryData/england_lsoa_2011.shp"
+manchester_lsoa <- st_read(shp_name)
+
+crimes_per_lsoa<- crimes_ms %>%
+  clean_names() %>%
+  group_by(lsoa_code) %>%
+  summarise(count=n())
+
+summary(crimes_per_lsoa)
+
+manchester_lsoa <- left_join(manchester_lsoa, crimes_per_lsoa, by = c("code"="lsoa_code"))
+# filter anything that isn't N/A
+new_map <- manchester_lsoa %>% filter(!is.na(count.y))
+
+ggplot() + 
+  annotation_map_tile() +  
+  geom_sf(data = manchester_lsoa, aes(fill = count.y), alpha = 0.7) + 
+  scale_fill_gradient2(name ="Number of crimes") 
+
+# Week 3 - thematic 
+tm_shape(new_map)
+current_style <- tmap_style("col_blind")
+
+map1 <- tm_shape(new_map) +
+  tm_fill("count.y", style="equal", title = "Equal") +  
+  tm_layout(legend.position = c("right", "bottom"),
+            legend.title.size = 0.8,
+            legend.text.size = 0.5)
+
+map1
+
+# jenks method, preferred by geographers:
+map2 <- tm_shape(new_map) + 
+  tm_fill("count.y", style="jenks", title = "Jenks") +
+  tm_layout(legend.position = c("right", "bottom"), 
+            legend.title.size = 0.8,
+            legend.text.size = 0.5)
+
+map2
+
+# quantile method, preferred by epidemiologists:
+map3 <- tm_shape(new_map) + 
+  tm_fill("count.y", style="quantile", title = "Quantile") +
+  tm_layout(legend.position = c("right", "bottom"), 
+            legend.title.size = 0.8,
+            legend.text.size = 0.5)
+
+map3
+
+# standard deviation map, which maps the values of our variable to distance to the mean value:
+map4 <- tm_shape(new_map) + 
+  tm_fill("count.y", style="sd", title = "Standard Deviation") +
+  tm_borders(alpha=0.1) +
+  tm_layout(legend.position = c("right", "bottom"), 
+            legend.title.size = 0.8,
+            legend.text.size = 0.5)
+
+map4
+
+tmap_arrange(map1, map2, map3, map4)
+
+# graduated symbols
+current_style <- tmap_style("col_blind")
+tm_shape(new_map) +                         
+  tm_bubbles("count.y", border.lwd=NA) +             
+  tm_borders(alpha=0.1) +                           
+  tm_layout(legend.position = c("right", "bottom"), 
+            legend.title.size = 0.8,
+            legend.text.size = 0.5)
+
+# week 5 - more on thematic maps
+# smoothing - sample size
+
+census_lsoa <- read_csv("Data_AGE_APPSOCG_DAYPOP_UNIT_URESPOP.csv")
+census_lsoa <- slice(census_lsoa, 3:284)
+census_lsoa <- dplyr::select(census_lsoa, GEO_CODE, F996:F323339)
+census_lsoa <- rename(census_lsoa, tothouse = F996, notdepr = F997, depriv1 = F998,
+                        depriv2 = F999, depriv3 = F1000, depriv4 = F1001, respop = F2384,
+                        wkdpop = F323339)
+
+new_map1 <- left_join(new_map, census_lsoa, by = c("code"="GEO_CODE"))
+
+
+new_map1 <- new_map1 %>% mutate(INTERSECT = st_intersects(.))
+new_map1[2:25] <- lapply(new_map1[2:25], as.numeric)
+
+
+new_map1 <- new_map1 %>% filter(!st_is_empty(.))
+
+res <- empbaysmooth(new_map1$count.y, new_map1$F2384.x*(sum(new_map1$count.y)/sum(new_map1$F2384.x)))
+new_map1$count.yEBS <- res$smthrr
+
+as.nb.sgbp <- function(x, ...) {
+  attrs <- attributes(x)
+  x <- lapply(x, function(i) { if(length(i) == 0L) 0L else i } )
+  attributes(x) <- attrs
+  class(x) <- "nb"
+  x
+} 
+
+w_sf <- as.nb.sgbp(new_map1$INTERSECT)
+
+eb2 <- EBlocal(new_map1$count.y, new_map1$F2384.x, w_sf)
+new_map1$count.yEBSL <- eb2$est 
+new_map1$INTERSECT <- NULL
+
+map1 <- tm_shape(new_map1) + 
+  tm_fill("count.y", style="quantile", title = "Raw rate", palette = "Reds") +
+  tm_layout(legend.position = c("left", "bottom"), 
+            legend.title.size = 0.8,
+            legend.text.size = 0.5)
+
+map1
+
+map2<- tm_shape(new_map1) + 
+  tm_fill("count.yEBS", style="quantile", title = "EB Smooth", palette = "Reds") +
+  tm_layout(legend.position = c("left", "bottom"), 
+            legend.title.size = 0.8,
+            legend.text.size = 0.5)
+
+map2
+
+map3<- tm_shape(new_map1) + 
+  tm_fill("count.yEBSL", style="quantile", title = "Local Smooth", palette = "Reds") +
+  tm_layout(legend.position = c("left", "bottom"), 
+            legend.title.size = 0.8,
+            legend.text.size = 0.5)
+
+map3
+
+tmap_arrange(map1, map2, map3) 
+
+# binning
+sfc_as_cols <- function(x, names = c("x","y")) {
+  stopifnot(inherits(x,"sf") && inherits(sf::st_geometry(x),"sfc_POINT"))
+  ret <- sf::st_coordinates(x)
+  ret <- tibble::as_tibble(ret)
+  stopifnot(length(names) == ncol(ret))
+  x <- x[ , !names(x) %in% names]
+  ret <- setNames(ret,names)
+  dplyr::bind_cols(x,ret)
+}
+
+crimes_ms_spatial <- sfc_as_cols(crimes_ms_spatial, c("lng", "lat"))
+
+ggplot(crimes_ms_spatial, aes(x = lng, y = lat)) +
+  annotation_map_tile() + 
+  stat_binhex(alpha=0.7) +                                      
+  scale_fill_gradientn(colours = c("yellow","red"), name = "Frequency")
+
+# week 4 spatial
+lic_prem <- read_csv("http://www.manchester.gov.uk/open/download/downloads/id/169/licensed_premises.csv")
+View(lic_prem)
+
+Moss_prems <- lic_prem %>%
+  filter(grepl("M14 ", POSTCODE))
+
+address <- "M14 6LE"
+geocode_result <- fromJSON(readLines(paste0("http://api.getthedata.com/postcode/",gsub(" ", "+", address))))
+
+geocode_result
+
+geocode_addys_getlng <- function(x){
+  
+  geocode_result <- fromJSON(readLines(paste0("http://api.getthedata.com/postcode/",gsub(" ", "", x))))
+  return(ifelse(!is.null(geocode_result$data$longitude), geocode_result$data$longitude, NA))
+}
+
+geocode_addys_getlat <- function(x){
+  
+  geocode_result <- fromJSON(readLines(paste0("http://api.getthedata.com/postcode/",gsub(" ", "", x))))
+  return(ifelse(!is.null(geocode_result$data$latitude), geocode_result$data$latitude, NA))
+}
+
+Moss_prems <- Moss_prems %>% 
+  mutate(longitude = map_chr(POSTCODE, geocode_addys_getlng),
+         latitude = map_chr(POSTCODE, geocode_addys_getlat))
+
+Moss_prems$latitude <- as.numeric(Moss_prems$latitude)
+Moss_prems$longitude <- as.numeric(Moss_prems$longitude)
+
+m <- leaflet(data = Moss_prems) %>%
+  addProviderTiles("Stamen.Toner") %>% 
+  addMarkers(lng=~longitude, lat=~latitude, popup=~as.character(PREMISESNAME), label = ~as.character(PREMISESNAME))
+
+m
+
+names(crimes_ms)
+
+cc_spatial <- st_as_sf(Moss_prems, coords = c("longitude", "latitude"), 
+                       crs = 4326, agr = "constant", na.fail = FALSE)
+
+manchester_ward <- st_read("https://raw.githubusercontent.com/RUMgroup/Spatial-data-in-R/master/rumgroup/data/wards.geojson")
+
+Moss <- manchester_ward %>%
+  filter(wd16nm == "Moss Side")
+
+plot(st_geometry(Moss))
+
+st_crs(crimes_ms) == st_crs(cc_spatial)
+
+st_crs(Moss) 
+
+cc_WGS84 <- st_transform(Moss, 4326)
+
+st_crs(cc_WGS84)
+
+st_crs(cc_WGS84) == st_crs(cc_spatial)
+
+cc_intersects <- st_intersects(cc_WGS84, cc_spatial)
+
+cc_intersects <- cc_spatial[unlist(cc_intersects),]
+
+# plot
+plot(st_geometry(cc_WGS84), border="#aaaaaa")
+plot(st_geometry(cc_intersects), col = "red", add=T)
+
+prem_BNG <- st_transform(cc_intersects, 27700)
+prem_buffer <- st_buffer(prem_BNG, 400)
+
+plot(st_geometry(prem_buffer))
+plot(st_geometry(prem_BNG), add = T)
+
+violent_spatial <- crimes_ms_spatial %>%
+  filter(crime_type == "Violence and sexual offences")
+
+buffer_WGS84 <- st_transform(prem_buffer_100, 4326)
+
+plot(st_geometry(buffer_WGS84))
+plot(st_geometry(violent_spatial), col = 'red', add = T)
+
+crimes_per_prem <- violent_spatial %>% 
+  st_join(buffer_WGS84, ., left = FALSE) %>% 
+  count(PREMISESNAME)
+
+pal <- colorBin("RdPu", domain = Moss_prems$n, bins = 5, pretty = TRUE)
+leaflet(crimes_per_prem) %>% 
+  addTiles() %>% 
+  addPolygons(fillColor = ~pal(n), fillOpacity = 0.8,
+              weight = 1, opacity = 1, color = "black",
+              label = ~as.character(PREMISESNAME)) %>% 
+  addLegend(pal = pal, values = ~n, opacity = 0.7, 
+            title = 'Violent crimes', position = "bottomleft") 
+
+# week 7 - spatial autocorrelation
+shp_name <- "BoundaryData/england_lsoa_2011.shp"
+manchester_lsoa <- st_read(shp_name)
+st_crs(manchester_lsoa)
+lsoa_WGS84 <- st_transform(manchester_lsoa, 4326)
+st_crs(lsoa_WGS84)
+rm(manchester_lsoa)
+
+crimes <- read_xlsx("gmp_crimes_2021.xlsx") %>% clean_names()
+crimes_ms <- filter(crimes, ward == "Moss Side")
+
+#Filter out to select drugs
+drugs <- filter(crimes_ms, crime_type == "Drugs")
+#Transform into spatial object
+drugs_spatial = st_as_sf(drugs, coords = c("longitude", "latitude"), 
+                            crs = 4326, agr = "constant")
+#Remove redundant 
+rm(drugs)
+rm(crimes_ms)
+#Select drugs that intersect with the Manchester city LSOA map.
+drugs_mc <- st_intersects(lsoa_WGS84, drugs_spatial)
+
+drugs_mc <- drugs_spatial[unlist(drugs_mc),]
+#Check results
+plot(st_geometry(drugs_mc))
+#Remove redundant objects
+rm(drugs_spatial)
+
+#Point in polygon spatial operation (be patient this can take time)
+drugs_per_lsoa <- drugs_mc %>% 
+  st_join(lsoa_WGS84, ., left = FALSE) %>% 
+  count(code)
+#Let's rename the column with the count of drugs (n) into something more meaningful
+drugs_per_lsoa <- rename(drugs_per_lsoa, drugs = n)
+#Plot with tmap
+tm_shape(drugs_per_lsoa) + 
+  tm_fill("drugs") +
+  tm_borders(alpha = 0.1) +
+  tm_layout(main.title = "Drugs count", main.title.size = 0.7 ,
+            legend.position = c("right", "bottom"), legend.title.size = 0.8)
+
+#Read a geojson file with Manchester wards
+manchester_ward <- st_read("wards.geojson")
+#Create a new object that only has the Moss Side ward
+df1 <- manchester_ward %>%
+  filter(wd16nm == "Moss Side")
+#Change coordinate systems
+ms_ward <- st_transform(df1, 4326)
+#Check if they match those of the imd_gm object
+st_crs(ms_ward) == st_crs(drugs_per_lsoa)
+
+#Get rid of objects we no longer need
+rm(manchester_ward)
+rm(df1)
+#Intersect
+ms_intersects <- st_intersects(ms_ward, drugs_per_lsoa)
+ms_drugs <- drugs_per_lsoa[unlist(ms_intersects),]
+
+#Plot with tmap
+tmap_mode("view")
+tm_shape(ms_drugs) + 
+  tm_fill("drugs", style = "quantile", palette = "Reds", id="code") +
+  tm_borders() +
+  tm_layout(main.title = "Drugs counts", main.title.size = 0.7 ,
+            legend.position = c("right", "top"), legend.title.size = 0.8)
+
+# create a list of neighbours
+drugs_mssp <- as(ms_drugs, "Spatial")
+ms_drugs$lsoa_code <- as.character(ms_drugs$code)
+w <- poly2nb(drugs_mssp, row.names=drugs_mssp$lsoa_code)
+class(w)
+summary(w)
+#We first plot the boundaries
+plot(drugs_mssp, col='gray', border='blue', lwd=2)
+#Then we use the coordinates function to obtain the coordinates of the polygon centroids
+xy <- coordinates(drugs_mssp)
+#Then we draw lines between the polygons centroids for neighbours that are listed as linked in w
+plot(w, xy, col='red', lwd=2, add=TRUE)
+
+# Moran's I
+ww <-  nb2listw(w, style='B')
+ww
+moran(drugs_mssp$drugs, ww, n=length(ww$neighbours), S0=Szero(ww))
+
+set.seed(1234) 
+drugs_moranmc_results <- moran.mc(drugs_mssp$drugs, ww, nsim=99)
+drugs_moranmc_results
+
+wm <- nb2mat(w, style='B')
+wm
+wm_rs <- nb2mat(w, style='W')
+wm_rs
+rwm <- mat2listw(wm, style='W')
+# Checking if rows add up to 1 (they should)
+mat <- listw2mat(rwm)
+#This code is simply adding each row to see if we get one when we add their values up, we are only displaying the first 15 rows in the matrix
+apply(mat, 1, sum)[1:15]
+moran.plot(drugs_mssp$drugs, rwm)
+
+
+#Coerce sf into sp
+drugs_m <- as(drugs_per_lsoa, "Spatial")
+#Generate list of neighbours using the Queen criteria
+w <- poly2nb(drugs_m, row.names=drugs_m$lsoa_code)
+#Generate list with weights using row standardisation
+ww <-  nb2listw(w, style='W')
+
+#scale the variable of interest and save it to a new column
+drugs_m$s_drugs <- scale(drugs_m$drugs) %>% as.vector()
+#create a spatial lag variable and save it to a new column
+drugs_m$lag_s_drugs <- lag.listw(ww, drugs_m$s_drugs)
+
+locm_bm <- localmoran(drugs_m$drugs, ww)
+summary(locm_bm)
+
+x <- drugs_m$s_drugs
+y <- drugs_m$lag_s_drugs
+xx <- tibble(x,y)
+moran.plot(x, ww)
+dataframe$new_variable <- ifelse(dataframe$some_numeric_var < 100, "smaller than 100", "not smaller than 100")
+
+drugs_m <- st_as_sf(drugs_m) %>% 
+  mutate(quad_sig = ifelse(drugs_m$s_drugs > 0 & 
+                             drugs_m$lag_s_drugs > 0 & 
+                             locm_bm[,5] <= 0.05, 
+                           "high-high",
+                           ifelse(drugs_m$s_drugs <= 0 & 
+                                    drugs_m$lag_s_drugs <= 0 & 
+                                    locm_bm[,5] <= 0.05, 
+                                  "low-low", 
+                                  ifelse(drugs_m$s_drugs > 0 & 
+                                           drugs_m$lag_s_drugs <= 0 & 
+                                           locm_bm[,5] <= 0.05, 
+                                         "high-low",
+                                         ifelse(drugs_m$s_drugs <= 0 & 
+                                                  drugs_m$lag_s_drugs > 0 & 
+                                                  locm_bm[,5] <= 0.05,
+                                                "low-high", 
+                                                "non-significant")))))
+
+table(drugs_m$quad_sig)
+qtm(drugs_m, fill="quad_sig", fill.title="LISA")
